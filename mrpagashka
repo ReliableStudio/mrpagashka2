@@ -1,0 +1,309 @@
+local RS = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local tweenService = game:GetService("TweenService")
+local rev_BlockPlacement = RS.Events.BlockPlacementEvent
+local rev_BlockRemoval = RS.Events.BlockRemovalEvent
+local rev_PlotRemoval = RS.Events.PlotRemovalEvent
+local rev_BlockPlacementVFX = RS.Events.BlockPlacementVFXEvent
+local rev_BlockPlacementVFX2 = RS.Events.BlockPlacementVFX2Event
+local rev_Text = RS.Events.TextEvent
+local rev_BlockGui = RS.Events.BlockGuiEvent
+local rev_ChangeSave = RS.Events.ChangeSaveEvent
+local ServerScriptService = game:GetService("ServerScriptService")
+local manager = require(ServerScriptService.PlayerData.Manager)
+
+local Assets = RS.Assets
+local placedBlocks = workspace:WaitForChild("PlacedBlocks")
+local Plots = workspace:WaitForChild("Plots")
+local assignedPlots = {} -- Table to list players and plot that is assigned to them
+local assignedSaves = {} -- Table to list players and Save that is assigned to them
+
+--  Table to list blocks and values that will be used by other functions
+
+local Blocks = {
+	Block = {
+		Cost = 50,
+		MaxNumber = 5,
+		Points = 0.5,
+		Place = "Center"
+	},
+	Sideway = {
+		Cost = 15,
+		MaxNumber = 5,
+		Points = 0.5,
+		Place = "Sideways"
+	},
+	Transparent = {
+		Cost = 15,
+		MaxNumber = 5,
+		Points = nil,
+		Place = "Center"
+	}
+}
+
+-- Table used to make CFrame value for block if it is placed sideways or in the center
+
+local sidewayChange = {
+	[90] = {0, 2},
+	[180] = {2, 0},
+	[270] = {0, 2},
+	[360] = {2, 0},
+}
+
+-- Function that returns rounded block position while placing it so they are placed in a grid
+
+local function roundPos(value)
+	value = value/4
+	value = math.round(value)
+	value = value * 4
+	return value
+end
+
+-- Function that returns Position which is pointed to Object Space of plot that it is placed on
+
+local function PointPosToObjectSpace(Pos, Plot)
+	local Plot = Plots:FindFirstChild(Plot).Plot
+	local blockPos = Plot.CFrame:PointToObjectSpace(Pos)
+	return blockPos
+end
+
+-- If Block is outside of plot function returns false
+
+local function canPlaceBlock(Pos, Plot)
+	local Plot = Plots:FindFirstChild(Plot).Plot
+
+	local blockPos = Plot.CFrame:PointToObjectSpace(Pos)
+	return (math.abs(blockPos.X) <= Plot.Size.X/2) and (math.abs(blockPos.Z) <= Plot.Size.Z/2)
+
+end
+
+-- This function which places block is used when player places block or when player picks new plot to place all blocks saved in his profile save
+
+local function placeBlock(plr, Block, blockPos, blockPosToObjectSpace, blockRotation)
+	local block = Assets.Blocks:FindFirstChild(Block, true):Clone()
+
+	block.CFrame =  CFrame.new( blockPos ) * CFrame.Angles(0, math.rad(blockRotation), 0) 
+	block.CanCollide = true
+	block.CanQuery = true
+	local placedBlocksPlot = nil
+	if placedBlocks:FindFirstChild(assignedPlots[plr.Name]) then
+		placedBlocksPlot = placedBlocks:FindFirstChild(assignedPlots[plr.Name])
+
+	else
+		placedBlocksPlot = Instance.new("Folder", placedBlocks)
+		placedBlocksPlot.Name = assignedPlots[plr.Name]
+	end
+	block.Parent = placedBlocksPlot
+
+	local ClickDetector = Instance.new("ClickDetector")
+	ClickDetector.Parent = block
+	ClickDetector.MouseClick:Connect(function(plr)
+		local plot = assignedPlots[plr.Name]
+		if plot == placedBlocksPlot.Name then
+			rev_BlockGui:FireClient(plr, block.Name, blockPos, blockPosToObjectSpace)
+		end
+	end)
+
+	rev_BlockPlacementVFX:FireAllClients(block.Position) -- client side VFX that will be visible for all players
+	rev_BlockPlacementVFX2:FireClient(plr, block.Position) -- client side VFX that will be visible for player who placed block
+end
+
+-- This function is used to place blocks on plot according to profile save when player picks new plot
+
+local function placePlot(plr)
+	local profile = manager.Profiles[plr]
+	local save = assignedSaves[plr]
+
+	local function placeBlocksOnPlot(v)
+		local plotPos = Plots:FindFirstChild(assignedPlots[plr.Name]):WaitForChild("Plot").Position
+		local blockPosToObjectSpace = Vector3.new(v.X, v.Y, v.Z)
+		local blockPos = plotPos + blockPosToObjectSpace
+
+		placeBlock(plr, v["Block"], blockPos, blockPosToObjectSpace, v["blockRotation"])
+	end
+
+	for i,v in profile.Data.Saves[save] do
+		task.spawn(placeBlocksOnPlot, v)
+	end
+end
+
+-- This function is used when player removes plot or leaves the game
+
+local function removePlot(plr)
+	if assignedPlots[plr.Name] ~= nil then
+		game.Debris:AddItem(placedBlocks:FindFirstChild(assignedPlots[plr.Name]), 0)
+		assignedPlots[plr.Name] = nil
+	end
+end
+
+-- Evens that are sent from client to server
+
+rev_BlockPlacement.OnServerEvent:Connect(function(plr, Block, placementPos, blockRotation)
+	if assignedPlots[plr.Name] == nil then -- If player do not have plot assigned he can no place blocks
+		rev_Text:FireClient(plr, "Assign Plot")
+		return
+	elseif canPlaceBlock(placementPos, assignedPlots[plr.Name]) == false then
+		rev_Text:FireClient(plr, "Block is outside of plot")
+		return
+	elseif Blocks[Block] == nil then
+		return
+	end
+
+	local profile = manager.Profiles[plr] 
+	local plot = assignedPlots[plr.Name]
+
+	local blockCost = Blocks[Block]["Cost"] 
+
+	if profile.Data.Points >= blockCost then
+		manager.ChangePoints(plr, -blockCost)
+	else
+		rev_Text:FireClient(plr, "Need More Points")
+		return
+	end
+
+	-- Block is placed sideways or in center according to Blocks table
+
+	local sideway = 2
+	local sideway2 = 2
+
+	if Blocks[Block]["Place"] == "Sideways" then
+		sideway = sidewayChange[blockRotation][1]
+		sideway2 = sidewayChange[blockRotation][2]
+	end
+
+	-- Make CFrame for block when placed 
+
+	local blockPos = Vector3.new(roundPos(placementPos.X + sideway) - sideway, roundPos(placementPos.Y) + Assets.Blocks:FindFirstChild(Block, true).Size.Y/2, roundPos(placementPos.Z + sideway2) - sideway2) 
+	local blockPosToObjectSpace = PointPosToObjectSpace(blockPos, plot)
+
+	-- Save block in profile save of player
+
+	local save = assignedSaves[plr]
+
+	if profile.Data.Saves[save][tostring(blockPosToObjectSpace)] ~= nil then
+		rev_Text:FireClient(plr, "Block is already placed on this position")
+		return
+	else
+		profile.Data.Saves[save][tostring(blockPosToObjectSpace)] = {
+			Block = Block,
+			X = blockPosToObjectSpace.X,
+			Y = blockPosToObjectSpace.Y,
+			Z = blockPosToObjectSpace.Z,
+			blockRotation = blockRotation,
+		}
+	end
+
+
+	placeBlock(plr, Block, blockPos, blockPosToObjectSpace, blockRotation)
+end)
+
+-- Put ClickDetector in every plot so they are clickable and plot is assigned to player when clicked
+
+for i,v in Plots:GetChildren() do 
+	local ClickDetector = v:WaitForChild("PickPlot"):WaitForChild("ClickDetector")
+
+	ClickDetector.MouseClick:Connect(function(plr)
+		local plot = ClickDetector.Parent.Parent.Name
+		if assignedPlots[plr.Name] ~= nil then return end
+		assignedPlots[plr.Name] = plot
+		plr.leaderstats.Plot.Value = plot
+
+		if assignedSaves[plr] == nil then
+			assignedSaves[plr] = "Save_1"
+		end
+
+		placePlot(plr)
+	end)
+end
+
+-- Remove plot of player when he leaves
+
+Players.PlayerRemoving:Connect(function(plr)
+	removePlot(plr)
+end)
+
+-- Remove block when client sends event
+
+rev_BlockRemoval.OnServerEvent:Connect(function(plr, blockPos, blockPosToObjectSpace)
+	local profile = manager.Profiles[plr]
+	local plot = assignedPlots[plr.Name]
+
+	local save = assignedSaves[plr]
+	profile.Data.Saves[save][tostring(blockPosToObjectSpace)] = nil
+
+	for i,v in placedBlocks:FindFirstChild(plot):GetChildren() do
+		if v.Position == blockPos then
+			game.Debris:AddItem(v, 0)
+		end
+	end
+
+end)
+
+-- Remove plot if player removed his plot
+
+rev_PlotRemoval.OnServerEvent:Connect(function(plr)
+	removePlot(plr)
+
+end)
+
+-- Change Save 
+
+rev_ChangeSave.OnServerEvent:Connect(function(plr, save)
+	if assignedSaves[plr] == nil or assignedPlots[plr.Name] == nil then
+		rev_Text:FireClient(plr, "No plot assigned")
+		return 
+	end
+	
+	if placedBlocks:FindFirstChild(assignedPlots[plr.Name]) ~= nil then
+		placedBlocks:FindFirstChild(assignedPlots[plr.Name]):Destroy()
+	end
+	
+	assignedSaves[plr] = save
+	
+	placePlot(plr)
+
+end)
+
+Players.PlayerAdded:Connect(function(plr)
+	local profile = manager.Profiles[plr]
+	if not profile then return end
+
+	local leaderstats = Instance.new("Folder")
+	leaderstats.Name = "leaderstats"
+	leaderstats.Parent = plr
+	local Points = Instance.new("NumberValue")
+	Points.Name = "Points"
+	Points.Value = profile.Data.Points
+	Points.Parent = leaderstats
+	local Plot = Instance.new("StringValue")
+	Plot.Name = "Plot"
+	Plot.Value = "no Plot"
+	Plot.Parent = leaderstats
+end)
+
+-- Players receive points if there are blocks palced on their plot which have points value assigned accoring to blocks table
+
+wait(5)
+
+local function ChangePointsBlock(plr, v)
+
+	local Points = Blocks[v["Block"]]["Points"]
+
+	if Points ~= nil then
+		manager.ChangePoints(plr, Points)
+	end
+end
+
+while wait(1) do
+	for i,plr in Players:GetPlayers() do
+		local profile = manager.Profiles[plr]
+		local Save = profile.Data.Saves[assignedSaves[plr]]
+
+		if assignedPlots[plr.Name] == nil then continue end
+
+		for i,v in Save do
+			task.spawn(ChangePointsBlock, plr, v)
+		end
+
+	end
+end
